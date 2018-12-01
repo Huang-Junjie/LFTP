@@ -3,20 +3,49 @@
 #include <unordered_map>
 #include <WinSock2.h>
 #pragma comment(lib,"Ws2_32.lib")
+#pragma comment(lib, "Winmm.lib")
 using namespace std;
 
 
 
 
 /****************全局变量**************/
-//客户端地址端口对应一个socket
+//客户端地址端口对应的socket
 unordered_map<unsigned long, unordered_map<unsigned short, SOCKET>> clientSocket; 
-
-
-
-
+//socket对应的客户端地址端口
+unordered_map<SOCKET, sockaddr_in> socketClientAddr;
+//每一个socket线程对应一个timeOut，和timeOutId
+unordered_map<SOCKET, pair<unsigned int, unsigned int>> socketTimeOut;
 /**************************************/
 
+/********************关闭socket********************/
+void closeSocket(SOCKET s) {
+	unsigned long clientIP = socketClientAddr[s].sin_addr.s_addr;
+	unsigned short clientPort = socketClientAddr[s].sin_port;
+	clientSocket[clientIP].erase(clientPort);
+	socketClientAddr.erase(s);
+	socketTimeOut.erase(s);
+}
+/***************************************************/
+
+/***********************重传函数********************/
+void WINAPI resendFilePathRequire(UINT wTimerID, UINT msg, DWORD dwUser, DWORD dwl, DWORD dw2) {
+	SOCKET s = dwUser;
+	if (socketTimeOut[s].first > 60000) {
+		cout << "disconnect client: (";
+		cout << socketClientAddr[s].sin_addr.s_addr << ", " << socketClientAddr[s].sin_port << ")" << endl;
+		timeKillEvent(socketTimeOut[s].second);
+		closeSocket(s);
+		return;
+	}
+	cout << "resent filePath to: (";
+	cout << socketClientAddr[s].sin_addr.s_addr << ", " << socketClientAddr[s].sin_port << ")" << endl;
+	socketTimeOut[s].first *= 2;
+	timeKillEvent(socketTimeOut[s].second);
+	socketTimeOut[s].second = timeSetEvent(socketTimeOut[s].first, 1, (LPTIMECALLBACK)resendFilePathRequire, DWORD(s), TIME_PERIODIC);
+	sendto(s, "filePath", 8, 0, (SOCKADDR *)&(socketClientAddr[s]), sizeof(socketClientAddr[s]));
+}
+/**************************************************/
 
 /***************线程函数***************/
 DWORD WINAPI getFileFromClient(LPVOID lpParameter) {
@@ -25,12 +54,15 @@ DWORD WINAPI getFileFromClient(LPVOID lpParameter) {
 }
 
 DWORD WINAPI sendFileToClient(LPVOID lpParameter) {
-	SOCKET * s = (SOCKET *)lpParameter;
+	SOCKET s = *((SOCKET *)lpParameter);
+	//响应客户端的请求，并且询问要发送的文件路径
+	sendto(s, "filePath", 8, 0, (SOCKADDR *)&(socketClientAddr[s]), sizeof(socketClientAddr[s]));
+	socketTimeOut[s].second = timeSetEvent(socketTimeOut[s].first, 1, (LPTIMECALLBACK)resendFilePathRequire, DWORD(s), TIME_PERIODIC);
+
+
+
 	return 0;
 }
-
-
-
 /**************************************/
 
 
@@ -45,7 +77,7 @@ int main(int argc, char* argv[]) {
 		return 0;
 	}
 
-	//创建socket
+	//创建监听socket
 	SOCKET listenSocket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
 	if (listenSocket == INVALID_SOCKET) {
 		cout << "socket create failed!" << endl;
@@ -71,20 +103,16 @@ int main(int argc, char* argv[]) {
 	int clientAddrLen = sizeof(clientAddr);
 	unsigned long clientIP;
 	unsigned short clientPort;
-
-	//服务器新建的socket的地址信息
-	sockaddr_in newServerAddr;
-	int newServerAddrLen = sizeof(newServerAddr);
 	
 	/**
 		监听客户端的请求；
-		当一个新的客户IP/PORT的请求报文到来时（第一次握手），
-		为它创建一个socket，发送该socket的端口号给客户端（第二次握手），并为该客户端创建新的线程；
-		客户端收到该端口号后，再给服务器监听端口号发送一次请求(lsend或lget)（第三次握手）；
-		若新的线程的socket一直收不到数据，则销毁该线程及socket
+		当listenSocket收到一个新的客户端IP/PORT的请求报文时，
+		为该客户端创建一个socket，并为它创建一个新的线程;
+		之后用新线程的socket给客户端发送消息;
+		客户端收到响应后，使用新的socket的与服务器传输数据;
+		若新的线程的socket迟迟得不到响应，则销毁该线程及socket
 	**/
 	char require[5];
-	unsigned short newPortNumber;
 	while (true) {
 		if (recvfrom(listenSocket, require, 5, 0, (SOCKADDR *)&clientAddr, &clientAddrLen) != -1) {
 			//获取客户端的IP, PORT
@@ -95,34 +123,20 @@ int main(int argc, char* argv[]) {
 				clientSocket[clientIP].count(clientPort) == 0 ||
 				clientSocket[clientIP][clientPort] == 0) {
 				//创建socket
-				cout << "create socket for: " << clientIP << ", " << clientPort << endl;
-				clientSocket[clientIP][clientPort] = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-				//获取新socket的地址信息，将新socket的port发给客户端
-				getsockname(clientSocket[clientIP][clientPort], (SOCKADDR*)&newServerAddr, &newServerAddrLen);
-				newPortNumber = newServerAddr.sin_port;
-				cout << "return socket port number for: " << clientIP << ", " << clientPort << endl;
-				sendto(listenSocket, (char *)&newPortNumber, 16, 0, (SOCKADDR *)&clientAddr, clientAddrLen);
+				cout << "create socket for: (" << clientIP << ", " << clientPort << ")" << endl;
+				SOCKET s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+				//添加全局变量map信息
+				clientSocket[clientIP][clientPort] = s;
+				socketClientAddr[s] = clientAddr;
+				socketTimeOut[s] = make_pair(2000, 0);
 				//创建线程
 				if (strncmp(require, "lsend", 5) == 0) {
-					HANDLE hThread1 = CreateThread(NULL, 0, getFileFromClient, (void *)&clientSocket[clientIP][clientPort], 0, NULL);
+					CreateThread(NULL, 0, getFileFromClient, (void *)&clientSocket[clientIP][clientPort], 0, NULL);
 				}
 				else if (strncmp(require, "lget", 4) == 0) {
-					HANDLE hThread1 = CreateThread(NULL, 0, sendFileToClient, (void *)&clientSocket[clientIP][clientPort], 0, NULL);
+					CreateThread(NULL, 0, sendFileToClient, (void *)&clientSocket[clientIP][clientPort], 0, NULL);
 				}
 			}
-			else {
-				cout << "return socket port number for: " << clientIP << ", " << clientPort << endl;
-				sendto(listenSocket, (char *)&newPortNumber, 16, 0, (SOCKADDR *)&clientAddr, clientAddrLen);
-			}
-
-
-
-
-
-
-			
-
-	
 		}
 	}
 

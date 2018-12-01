@@ -10,9 +10,8 @@ using namespace std;
 
 
 /***************全局变量****************************/
-int timeOut = 2000;		//初始时timeOut定为2s
-int timeOutId;				
-unsigned short dataPortNumber;	
+unsigned int timeOut = 2000;		//初始时timeOut定为2s
+unsigned int timeOutId;
 sockaddr_in serverAddr;	
 int serveraddrLen;
 SOCKET s;
@@ -27,28 +26,29 @@ struct data {
 /***********************重传函数********************/
 void WINAPI resendGetRequire(UINT wTimerID, UINT msg, DWORD dwUser, DWORD dwl, DWORD dw2) {
 	if (timeOut > 60000) {
-		cout << "request timeout!" << endl;
+		cout << "connect server failed!" << endl;
 		exit(0);
 	}
-	cout << "resent lget request" << endl;
+	cout << "request timeout, resent lget request" << endl;
 	timeOut *= 2;
 	timeKillEvent(timeOutId);
 	timeOutId = timeSetEvent(timeOut, 1, (LPTIMECALLBACK)resendGetRequire, DWORD(1), TIME_PERIODIC);
 	sendto(s, "lget", 4, 0, (SOCKADDR *)&serverAddr, serveraddrLen);
 }
 
-
-
-
-
-
-
 void WINAPI resendSendRequire(UINT wTimerID, UINT msg, DWORD dwUser, DWORD dwl, DWORD dw2) {
-	sendto(s, "lsend", 5, 0, (SOCKADDR *)&serverAddr, serveraddrLen);
-	cout << "resent lsend" << endl;
+	if (timeOut > 60000) {
+		cout << "connect server failed!" << endl;
+		exit(0);
+	}
+	cout << "request timeout, resent lsend request" << endl;
+	timeOut *= 2;
+	timeKillEvent(timeOutId);
+	timeOutId = timeSetEvent(timeOut, 1, (LPTIMECALLBACK)resendSendRequire, DWORD(1), TIME_PERIODIC);
+	sendto(s, "lsend", 4, 0, (SOCKADDR *)&serverAddr, serveraddrLen);
 }
-
 /**************************************************/
+
 
 int main(int argc, char* argv[]) {
 	//检查参数
@@ -78,6 +78,7 @@ int main(int argc, char* argv[]) {
 	//创建socket
 	s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
 
+/**************************************************************************************************/
 	//上传文件
 	if (strncmp(argv[1], "lsend", 5) == 0) {
 		//读取文件
@@ -87,42 +88,54 @@ int main(int argc, char* argv[]) {
 		}
 
 		//向服务器发送请求
-		sendto(s, "lsend", 5, 0, (SOCKADDR *)&serverAddr, serveraddrLen);
+		/*sendto(s, "lsend", 5, 0, (SOCKADDR *)&serverAddr, serveraddrLen);
 		timeOutId = timeSetEvent(timeOut, 1, (LPTIMECALLBACK)resendSendRequire, DWORD(1), TIME_PERIODIC);
 		if (recvfrom(s, (char *)&dataPortNumber, 16, 0, (SOCKADDR *)&serverAddr, &serveraddrLen) != -1) {
 			timeKillEvent(timeOutId);
-			cout << "get server port: " << dataPortNumber << endl;
-		}
+			cout << "连接服务器成功！"  << endl;
+		}*/
 
 		while (1) {
 
 		}
 	}
-
+/********************************************************************************************************/
+/********************************************************************************************************/
 	//下载文件
 	else if (strncmp(argv[1], "lget", 4) == 0) {
 		//向服务器发送请求
+		char response[8];
 		sendto(s, "lget", 4, 0, (SOCKADDR *)&serverAddr, serveraddrLen);
 		timeOutId = timeSetEvent(timeOut, 1, (LPTIMECALLBACK)resendGetRequire, DWORD(1), TIME_PERIODIC);
-		if (recvfrom(s, (char *)&dataPortNumber, 16, 0, (SOCKADDR *)&serverAddr, &serveraddrLen) != -1) {
-			//收到响应，得到传输数据的端口
+		if (recvfrom(s, response, 8, 0, (SOCKADDR *)&serverAddr, &serveraddrLen) != -1) {
 			timeKillEvent(timeOutId);
-			sendto(s, "ACK", 3, 0, (SOCKADDR *)&serverAddr, serveraddrLen);
-			cout << "get server port: " << dataPortNumber << endl;
+			if (strncmp(response, "filePath", 4) == 0) {
+				cout << "连接服务器成功！" << endl;
+			}
+			else {
+				cout << "get an incorrect response!" << endl;
+				return 0;
+			}
 		}
+		
+		//向服务器发送要下载的文件路径
+
+
+
+		
 
 
 
 
 
 	}
-
+/*************************************************************************************************************/
 	//命令错误
 	else {
 		cout << "Please input: LFTP {lsend | lget} <myserver> <mylargefile>" << endl;
 		return 0;
 	}
-
+/************************************************************************************************************/
 	return 0;
 	WSACleanup();
 }
