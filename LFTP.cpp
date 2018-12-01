@@ -15,11 +15,13 @@ unsigned int timeOutId;
 sockaddr_in serverAddr;	
 int serveraddrLen;
 SOCKET s;
-struct data {
-	int seq;
-	int ack;
+char* filePath;
+struct packet{
+	unsigned int seq;
 	char buff[1024];
 };
+
+packet rcvBuff[1000];
 /**************************************************/
 
 
@@ -30,10 +32,9 @@ void WINAPI resendGetRequire(UINT wTimerID, UINT msg, DWORD dwUser, DWORD dwl, D
 		exit(0);
 	}
 	cout << "request timeout, resent lget request" << endl;
-	timeOut *= 2;
-	timeKillEvent(timeOutId);
-	timeOutId = timeSetEvent(timeOut, 1, (LPTIMECALLBACK)resendGetRequire, DWORD(1), TIME_PERIODIC);
 	sendto(s, "lget", 4, 0, (SOCKADDR *)&serverAddr, serveraddrLen);
+	timeOut *= 2;
+	timeOutId = timeSetEvent(timeOut, 1, (LPTIMECALLBACK)resendGetRequire, DWORD(1), TIME_ONESHOT);
 }
 
 void WINAPI resendSendRequire(UINT wTimerID, UINT msg, DWORD dwUser, DWORD dwl, DWORD dw2) {
@@ -42,10 +43,20 @@ void WINAPI resendSendRequire(UINT wTimerID, UINT msg, DWORD dwUser, DWORD dwl, 
 		exit(0);
 	}
 	cout << "request timeout, resent lsend request" << endl;
-	timeOut *= 2;
-	timeKillEvent(timeOutId);
-	timeOutId = timeSetEvent(timeOut, 1, (LPTIMECALLBACK)resendSendRequire, DWORD(1), TIME_PERIODIC);
 	sendto(s, "lsend", 4, 0, (SOCKADDR *)&serverAddr, serveraddrLen);
+	timeOut *= 2;
+	timeOutId = timeSetEvent(timeOut, 1, (LPTIMECALLBACK)resendSendRequire, DWORD(1), TIME_ONESHOT);
+}
+
+void WINAPI resendFilePath(UINT wTimerID, UINT msg, DWORD dwUser, DWORD dwl, DWORD dw2) {
+	if (timeOut > 60000) {
+		cout << "disconnect from the server!" << endl;
+		exit(0);
+	}
+	cout << "timeout, resent file path" << endl;
+	sendto(s, filePath, strlen(filePath), 0, (SOCKADDR *)&serverAddr, serveraddrLen);
+	timeOut *= 2;
+	timeOutId = timeSetEvent(timeOut, 1, (LPTIMECALLBACK)resendSendRequire, DWORD(1), TIME_ONESHOT);
 }
 /**************************************************/
 
@@ -55,6 +66,7 @@ int main(int argc, char* argv[]) {
 	if (argc != 4) {
 		cout << "Please input: LFTP {lsend | lget} <myserver> <mylargefile>" << endl;
 	}
+	filePath = argv[3];
 
 	//初始化Winsock相关的ddl
 	WSAData wsa;
@@ -89,7 +101,7 @@ int main(int argc, char* argv[]) {
 
 		//向服务器发送请求
 		/*sendto(s, "lsend", 5, 0, (SOCKADDR *)&serverAddr, serveraddrLen);
-		timeOutId = timeSetEvent(timeOut, 1, (LPTIMECALLBACK)resendSendRequire, DWORD(1), TIME_PERIODIC);
+		timeOutId = timeSetEvent(timeOut, 1, (LPTIMECALLBACK)resendSendRequire, DWORD(1), TIME_ONESHOT);
 		if (recvfrom(s, (char *)&dataPortNumber, 16, 0, (SOCKADDR *)&serverAddr, &serveraddrLen) != -1) {
 			timeKillEvent(timeOutId);
 			cout << "连接服务器成功！"  << endl;
@@ -106,7 +118,7 @@ int main(int argc, char* argv[]) {
 		//向服务器发送请求
 		char response[8];
 		sendto(s, "lget", 4, 0, (SOCKADDR *)&serverAddr, serveraddrLen);
-		timeOutId = timeSetEvent(timeOut, 1, (LPTIMECALLBACK)resendGetRequire, DWORD(1), TIME_PERIODIC);
+		timeOutId = timeSetEvent(timeOut, 1, (LPTIMECALLBACK)resendGetRequire, DWORD(1), TIME_ONESHOT);
 		if (recvfrom(s, response, 8, 0, (SOCKADDR *)&serverAddr, &serveraddrLen) != -1) {
 			timeKillEvent(timeOutId);
 			if (strncmp(response, "filePath", 4) == 0) {
@@ -117,10 +129,26 @@ int main(int argc, char* argv[]) {
 				return 0;
 			}
 		}
-		
 		//向服务器发送要下载的文件路径
+		sendto(s, argv[3], strlen(argv[3]), 0, (SOCKADDR *)&serverAddr, serveraddrLen);
+		timeOutId = timeSetEvent(timeOut, 1, (LPTIMECALLBACK)resendFilePath, DWORD(1), TIME_ONESHOT);
 
 
+
+
+
+
+
+		if (recvfrom(s, response, 8, 0, (SOCKADDR *)&serverAddr, &serveraddrLen) != -1) {
+			timeKillEvent(timeOutId);
+			if (strncmp(response, "filePath", 4) == 0) {
+				cout << "连接服务器成功！" << endl;
+			}
+			else {
+				cout << "get an incorrect response!" << endl;
+				return 0;
+			}
+		}
 
 		
 

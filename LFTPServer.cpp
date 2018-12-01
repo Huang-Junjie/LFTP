@@ -14,8 +14,26 @@ using namespace std;
 unordered_map<unsigned long, unordered_map<unsigned short, SOCKET>> clientSocket; 
 //socket对应的客户端地址端口
 unordered_map<SOCKET, sockaddr_in> socketClientAddr;
+//socket对应的线程
+unordered_map<SOCKET, HANDLE> socketThread;
 //每一个socket线程对应一个timeOut，和timeOutId
 unordered_map<SOCKET, pair<unsigned int, unsigned int>> socketTimeOut;
+//每一个socket线程对应一个sendBase
+unordered_map<SOCKET, int> socketSendBase;
+//数据包结构体
+struct packet{
+	unsigned int seq;
+	unsigned int buffDataLen;
+	bool ifACKed;
+	char buff[1024];
+};
+
+struct ackpacket {
+	unsigned int ack;
+	unsigned int rwnd;
+};
+//每一个socket线程对应一个packet数组
+unordered_map<SOCKET, vector<packet>> socketPacket;
 /**************************************/
 
 /********************关闭socket********************/
@@ -24,7 +42,10 @@ void closeSocket(SOCKET s) {
 	unsigned short clientPort = socketClientAddr[s].sin_port;
 	clientSocket[clientIP].erase(clientPort);
 	socketClientAddr.erase(s);
+	socketThread.erase(s);
 	socketTimeOut.erase(s);
+	socketSendBase.erase(s);
+	socketPacket.erase(s);
 }
 /***************************************************/
 
@@ -32,18 +53,21 @@ void closeSocket(SOCKET s) {
 void WINAPI resendFilePathRequire(UINT wTimerID, UINT msg, DWORD dwUser, DWORD dwl, DWORD dw2) {
 	SOCKET s = dwUser;
 	if (socketTimeOut[s].first > 60000) {
-		cout << "disconnect client: (";
+		cout << "disconnect from the client: (";
 		cout << socketClientAddr[s].sin_addr.s_addr << ", " << socketClientAddr[s].sin_port << ")" << endl;
-		timeKillEvent(socketTimeOut[s].second);
+		TerminateThread(socketThread[s], 0);
 		closeSocket(s);
 		return;
 	}
 	cout << "resent filePath to: (";
 	cout << socketClientAddr[s].sin_addr.s_addr << ", " << socketClientAddr[s].sin_port << ")" << endl;
-	socketTimeOut[s].first *= 2;
-	timeKillEvent(socketTimeOut[s].second);
-	socketTimeOut[s].second = timeSetEvent(socketTimeOut[s].first, 1, (LPTIMECALLBACK)resendFilePathRequire, DWORD(s), TIME_PERIODIC);
 	sendto(s, "filePath", 8, 0, (SOCKADDR *)&(socketClientAddr[s]), sizeof(socketClientAddr[s]));
+	socketTimeOut[s].first *= 2;
+	socketTimeOut[s].second = timeSetEvent(socketTimeOut[s].first, 1, (LPTIMECALLBACK)resendFilePathRequire, DWORD(s), TIME_ONESHOT);
+}
+
+void WINAPI resendFileData(UINT wTimerID, UINT msg, DWORD dwUser, DWORD dwl, DWORD dw2) {
+	SOCKET s = dwUser;
 }
 /**************************************************/
 
@@ -57,7 +81,67 @@ DWORD WINAPI sendFileToClient(LPVOID lpParameter) {
 	SOCKET s = *((SOCKET *)lpParameter);
 	//响应客户端的请求，并且询问要发送的文件路径
 	sendto(s, "filePath", 8, 0, (SOCKADDR *)&(socketClientAddr[s]), sizeof(socketClientAddr[s]));
-	socketTimeOut[s].second = timeSetEvent(socketTimeOut[s].first, 1, (LPTIMECALLBACK)resendFilePathRequire, DWORD(s), TIME_PERIODIC);
+	socketTimeOut[s].second = timeSetEvent(socketTimeOut[s].first, 1, (LPTIMECALLBACK)resendFilePathRequire, DWORD(s), TIME_ONESHOT);
+	sockaddr_in clientAddr;
+	char filePath[301];
+	int pathLen;
+	//收到要发给客户端的文件的路径
+	if ((pathLen = recvfrom(s, filePath, 300, 0, (SOCKADDR *)&clientAddr, NULL)) != -1) {
+		timeKillEvent(socketTimeOut[s].second);
+		socketTimeOut[s].first = 2000;
+		//防止错误的IP/端口发来的错误信息
+		if (clientAddr.sin_addr.s_addr != socketClientAddr[s].sin_addr.s_addr ||
+			clientAddr.sin_port != socketClientAddr[s].sin_port) {
+			cout << "get message from error address: (" << endl;
+			cout << socketClientAddr[s].sin_addr.s_addr << ", " << socketClientAddr[s].sin_port << ")" << endl;
+			closeSocket(s);
+			return 0;
+		}
+		filePath[pathLen] = '\0';
+	}
+	//打开文件
+	ifstream file(filePath, ios_base::in | ios_base::binary);
+	if (!file) {
+		cout << "file open failed: (" << endl; 
+		cout << socketClientAddr[s].sin_addr.s_addr << ", " << socketClientAddr[s].sin_port << ")" << endl;
+		closeSocket(s);
+		return 0;
+	}
+
+	int seq;
+	int rwnd = 1000;
+	int nextseqnum = 0;
+	ackpacket senderMessage;
+	while (!file.eof()) {
+		while (!file.eof() && ((nextseqnum + 1001 - socketSendBase[s]) % 1001) < rwnd) {
+			file.read((char*)(&(socketPacket[s][nextseqnum].buff)), 1024);
+			socketPacket[s][nextseqnum].buffDataLen = file.gcount();
+			if (socketPacket[s][nextseqnum].buffDataLen == 0) continue;
+			socketPacket[s][nextseqnum].seq = seq;
+			socketPacket[s][nextseqnum].ifACKed = false;
+			seq++;
+			sendto(s,(char *)(&socketPacket[s][nextseqnum]), sizeof(packet), 0, (SOCKADDR *)&(socketClientAddr[s]), sizeof(socketClientAddr[s]));
+			nextseqnum = (nextseqnum + 1) & 1001;
+		}
+		socketTimeOut[s].second = timeSetEvent(socketTimeOut[s].first, 1, (LPTIMECALLBACK)resendFileData, DWORD(s), TIME_ONESHOT);
+		if (recvfrom(s, (char *)&senderMessage, sizeof(senderMessage), 0, (SOCKADDR *)&clientAddr, NULL) != -1) {
+			//防止错误的IP/端口发来的错误信息
+			if (clientAddr.sin_addr.s_addr != socketClientAddr[s].sin_addr.s_addr ||
+				clientAddr.sin_port != socketClientAddr[s].sin_port) {
+				continue;
+			}
+			if (senderMessage.ack > socketPacket[s][socketSendBase[s]].seq) {
+				socketSendBase[s] = (socketSendBase[s] + senderMessage.ack - socketPacket[s][socketSendBase[s]].seq) % 1001;
+			}
+			for (int i = socketSendBase[s]; i != nextseqnum; i = (i + 1) % 1001) {
+				if (senderMessage.seq == socketPacket[s][i].seq) {
+					socketSendBase[s] = (i + 1) % 1001;
+					break;
+					
+				}
+			}
+		}
+	}
 
 
 
@@ -115,6 +199,9 @@ int main(int argc, char* argv[]) {
 	char require[5];
 	while (true) {
 		if (recvfrom(listenSocket, require, 5, 0, (SOCKADDR *)&clientAddr, &clientAddrLen) != -1) {
+			if (strncmp(require, "lsend", 5) != 0 && strncmp(require, "lget", 4) != 0) {
+				continue;
+			}
 			//获取客户端的IP, PORT
 			clientIP = clientAddr.sin_addr.s_addr;
 			clientPort = clientAddr.sin_port;
@@ -129,12 +216,14 @@ int main(int argc, char* argv[]) {
 				clientSocket[clientIP][clientPort] = s;
 				socketClientAddr[s] = clientAddr;
 				socketTimeOut[s] = make_pair(2000, 0);
+				socketSendBase[s] = 0;
+				socketPacket[s] = vector<packet>(1001);
 				//创建线程
 				if (strncmp(require, "lsend", 5) == 0) {
-					CreateThread(NULL, 0, getFileFromClient, (void *)&clientSocket[clientIP][clientPort], 0, NULL);
+					socketThread[s] = CreateThread(NULL, 0, getFileFromClient, (void *)&clientSocket[clientIP][clientPort], 0, NULL);
 				}
 				else if (strncmp(require, "lget", 4) == 0) {
-					CreateThread(NULL, 0, sendFileToClient, (void *)&clientSocket[clientIP][clientPort], 0, NULL);
+					socketThread[s] = CreateThread(NULL, 0, sendFileToClient, (void *)&clientSocket[clientIP][clientPort], 0, NULL);
 				}
 			}
 		}
