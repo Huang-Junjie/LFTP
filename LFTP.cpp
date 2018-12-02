@@ -16,11 +16,18 @@ sockaddr_in serverAddr;
 int serveraddrLen;
 SOCKET s;
 char* filePath;
-struct packet{
+//数据包结构体
+struct packet {
 	unsigned int seq;
+	unsigned int buffDataLen;
+	bool ifRcv;
 	char buff[1024];
 };
-
+//ack包结构体,含ack和接收窗口大小
+struct ackpacket {
+	unsigned int ack;
+	unsigned int rwnd;
+};
 packet rcvBuff[1000];
 /**************************************************/
 
@@ -54,7 +61,7 @@ void WINAPI resendFilePath(UINT wTimerID, UINT msg, DWORD dwUser, DWORD dwl, DWO
 		exit(0);
 	}
 	cout << "timeout, resent file path" << endl;
-	sendto(s, filePath, strlen(filePath), 0, (SOCKADDR *)&serverAddr, serveraddrLen);
+	sendto(s, filePath, strlen(filePath) + 1, 0, (SOCKADDR *)&serverAddr, serveraddrLen);
 	timeOut *= 2;
 	timeOutId = timeSetEvent(timeOut, 1, (LPTIMECALLBACK)resendSendRequire, DWORD(1), TIME_ONESHOT);
 }
@@ -130,25 +137,84 @@ int main(int argc, char* argv[]) {
 			}
 		}
 		//向服务器发送要下载的文件路径
-		sendto(s, argv[3], strlen(argv[3]), 0, (SOCKADDR *)&serverAddr, serveraddrLen);
+		sendto(s, filePath, strlen(filePath) + 1, 0, (SOCKADDR *)&serverAddr, serveraddrLen);
 		timeOutId = timeSetEvent(timeOut, 1, (LPTIMECALLBACK)resendFilePath, DWORD(1), TIME_ONESHOT);
 
-
-
-
-
-
-
-		if (recvfrom(s, response, 8, 0, (SOCKADDR *)&serverAddr, &serveraddrLen) != -1) {
-			timeKillEvent(timeOutId);
-			if (strncmp(response, "filePath", 4) == 0) {
-				cout << "连接服务器成功！" << endl;
-			}
-			else {
-				cout << "get an incorrect response!" << endl;
-				return 0;
-			}
+		//创建文件
+		ofstream file(filePath, ios_base::in | ios_base::binary);
+		if (!file) {
+			cout << "create file failed: (" << endl;
+			return 0;
 		}
+
+		//开始下载文件
+		unsigned int rcvBase = 0;		//缓冲区起始下标
+		unsigned int expectSeq = 0;		//期待收到的报文的seq
+		unsigned int lastRcvSeq = 0;	//收到的报文的最大seq
+		sockaddr_in recvfromAddr;
+		packet rcvPacket;
+		ackpacket ackMessage;
+		while (true) {
+			if (recvfrom(s, (char *)&rcvPacket, sizeof(packet), 0, (SOCKADDR *)&recvfromAddr, NULL) != -1) {
+				timeKillEvent(timeOutId);
+				//防止错误的IP/端口发来的信息
+				if (recvfromAddr.sin_addr.s_addr != serverAddr.sin_addr.s_addr ||
+					recvfromAddr.sin_port != serverAddr.sin_port) {
+					continue;
+				}
+
+				//比期望序号大的失序报文，立即发送冗余ack
+				if (rcvPacket.seq > expectSeq) {
+					if (rcvPacket.seq > lastRcvSeq) lastRcvSeq = rcvPacket.seq;
+					unsigned int index = (rcvBase + rcvPacket.seq - expectSeq) % 1000;
+					memcpy((void *)&(rcvBuff[index]), (void *)&rcvPacket, sizeof(packet));
+					//发送冗余ack
+					ackMessage.ack = expectSeq;
+					ackMessage.rwnd = 1000 - (lastRcvSeq - expectSeq + 1);
+					sendto(s, (char *)&ackMessage, sizeof(ackMessage), 0, (SOCKADDR *)&serverAddr, serveraddrLen);
+				}
+				//比期望序号小的报文
+				else if (rcvPacket.seq < expectSeq){
+					ackMessage.ack = expectSeq;
+					ackMessage.rwnd = 1000 - (lastRcvSeq - expectSeq + 1);
+					sendto(s, (char *)&ackMessage, sizeof(ackMessage), 0, (SOCKADDR *)&serverAddr, serveraddrLen);
+				}
+				else {
+					if (rcvPacket.seq > lastRcvSeq) lastRcvSeq = rcvPacket.seq;
+					memcpy((void *)&(rcvBuff[rcvBase]), (void *)&rcvPacket, sizeof(packet));
+					//写入文件
+					while (rcvBuff[rcvBase].ifRcv) {
+						file.write(rcvBuff[rcvBase].buff, rcvBuff[rcvBase].buffDataLen);
+						rcvBuff[rcvBase].ifRcv = false;
+						rcvBase = (rcvBase + 1) % 1000;
+						expectSeq++;
+					}
+
+
+					//发送冗余ack
+					ackMessage.ack = expectSeq;
+					ackMessage.rwnd = 1000 - (lastRcvSeq - expectSeq + 1);
+					sendto(s, (char *)&ackMessage, sizeof(ackMessage), 0, (SOCKADDR *)&serverAddr, serveraddrLen);
+				}
+				
+				
+				
+				
+				
+				
+				
+			}
+
+
+
+		}
+
+
+
+
+
+
+		
 
 		
 

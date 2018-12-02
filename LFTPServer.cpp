@@ -19,15 +19,15 @@ unordered_map<SOCKET, HANDLE> socketThread;
 //每一个socket线程对应一个timeOut，和timeOutId
 unordered_map<SOCKET, pair<unsigned int, unsigned int>> socketTimeOut;
 //每一个socket线程对应一个sendBase
-unordered_map<SOCKET, int> socketSendBase;
+unordered_map<SOCKET, unsigned int> socketSendBase;
 //数据包结构体
 struct packet{
 	unsigned int seq;
 	unsigned int buffDataLen;
-	bool ifACKed;
+	bool ifRcv;
 	char buff[1024];
 };
-
+//ack包结构体,含ack和接收窗口大小
 struct ackpacket {
 	unsigned int ack;
 	unsigned int rwnd;
@@ -68,6 +68,16 @@ void WINAPI resendFilePathRequire(UINT wTimerID, UINT msg, DWORD dwUser, DWORD d
 
 void WINAPI resendFileData(UINT wTimerID, UINT msg, DWORD dwUser, DWORD dwl, DWORD dw2) {
 	SOCKET s = dwUser;
+	if (socketTimeOut[s].first > 60000) {
+		cout << "disconnect from the client: (";
+		cout << socketClientAddr[s].sin_addr.s_addr << ", " << socketClientAddr[s].sin_port << ")" << endl;
+		TerminateThread(socketThread[s], 0);
+		closeSocket(s);
+		return;
+	}
+	sendto(s, (char *)(&socketPacket[s][socketSendBase[s]]), sizeof(packet), 0, (SOCKADDR *)&(socketClientAddr[s]), sizeof(socketClientAddr[s]));
+	socketTimeOut[s].first *= 2;
+	socketTimeOut[s].second = timeSetEvent(socketTimeOut[s].first, 1, (LPTIMECALLBACK)resendFilePathRequire, DWORD(s), TIME_ONESHOT);
 }
 /**************************************************/
 
@@ -84,12 +94,11 @@ DWORD WINAPI sendFileToClient(LPVOID lpParameter) {
 	socketTimeOut[s].second = timeSetEvent(socketTimeOut[s].first, 1, (LPTIMECALLBACK)resendFilePathRequire, DWORD(s), TIME_ONESHOT);
 	sockaddr_in clientAddr;
 	char filePath[301];
-	int pathLen;
 	//收到要发给客户端的文件的路径
-	if ((pathLen = recvfrom(s, filePath, 300, 0, (SOCKADDR *)&clientAddr, NULL)) != -1) {
+	if (recvfrom(s, filePath, 300, 0, (SOCKADDR *)&clientAddr, NULL) != -1) {
 		timeKillEvent(socketTimeOut[s].second);
 		socketTimeOut[s].first = 2000;
-		//防止错误的IP/端口发来的错误信息
+		//防止错误的IP/端口发来的信息
 		if (clientAddr.sin_addr.s_addr != socketClientAddr[s].sin_addr.s_addr ||
 			clientAddr.sin_port != socketClientAddr[s].sin_port) {
 			cout << "get message from error address: (" << endl;
@@ -97,7 +106,6 @@ DWORD WINAPI sendFileToClient(LPVOID lpParameter) {
 			closeSocket(s);
 			return 0;
 		}
-		filePath[pathLen] = '\0';
 	}
 	//打开文件
 	ifstream file(filePath, ios_base::in | ios_base::binary);
@@ -108,43 +116,84 @@ DWORD WINAPI sendFileToClient(LPVOID lpParameter) {
 		return 0;
 	}
 
-	int seq;
-	int rwnd = 1000;
-	int nextseqnum = 0;
+	cout << "begin sent file to: (";
+	cout << socketClientAddr[s].sin_addr.s_addr << ", " << socketClientAddr[s].sin_port << ")" << endl;
+
+	unsigned int seq = 0;
+	unsigned int rwnd = 1000;
+	unsigned int nextseqnum = 0;
+	unsigned int redundancy = 0;
 	ackpacket senderMessage;
 	while (!file.eof()) {
 		while (!file.eof() && ((nextseqnum + 1001 - socketSendBase[s]) % 1001) < rwnd) {
+			if (socketSendBase[s] == nextseqnum) {
+				socketTimeOut[s].second = timeSetEvent(socketTimeOut[s].first, 1, (LPTIMECALLBACK)resendFileData, DWORD(s), TIME_ONESHOT);
+			}
 			file.read((char*)(&(socketPacket[s][nextseqnum].buff)), 1024);
 			socketPacket[s][nextseqnum].buffDataLen = file.gcount();
 			if (socketPacket[s][nextseqnum].buffDataLen == 0) continue;
 			socketPacket[s][nextseqnum].seq = seq;
-			socketPacket[s][nextseqnum].ifACKed = false;
+			socketPacket[s][nextseqnum].ifRcv = false;
 			seq++;
 			sendto(s,(char *)(&socketPacket[s][nextseqnum]), sizeof(packet), 0, (SOCKADDR *)&(socketClientAddr[s]), sizeof(socketClientAddr[s]));
 			nextseqnum = (nextseqnum + 1) & 1001;
 		}
-		socketTimeOut[s].second = timeSetEvent(socketTimeOut[s].first, 1, (LPTIMECALLBACK)resendFileData, DWORD(s), TIME_ONESHOT);
 		if (recvfrom(s, (char *)&senderMessage, sizeof(senderMessage), 0, (SOCKADDR *)&clientAddr, NULL) != -1) {
-			//防止错误的IP/端口发来的错误信息
+			//防止错误的IP/端口发来的信息
 			if (clientAddr.sin_addr.s_addr != socketClientAddr[s].sin_addr.s_addr ||
 				clientAddr.sin_port != socketClientAddr[s].sin_port) {
 				continue;
 			}
+			//ack > base: ack之前的都被确认，因此base = ack
 			if (senderMessage.ack > socketPacket[s][socketSendBase[s]].seq) {
+				socketTimeOut[s].first = 2000;
 				socketSendBase[s] = (socketSendBase[s] + senderMessage.ack - socketPacket[s][socketSendBase[s]].seq) % 1001;
-			}
-			for (int i = socketSendBase[s]; i != nextseqnum; i = (i + 1) % 1001) {
-				if (senderMessage.seq == socketPacket[s][i].seq) {
-					socketSendBase[s] = (i + 1) % 1001;
-					break;
-					
+				redundancy = 0;
+				timeKillEvent(socketTimeOut[s].second);
+				if (socketSendBase[s] != nextseqnum) {
+					socketTimeOut[s].second = timeSetEvent(socketTimeOut[s].first, 1, (LPTIMECALLBACK)resendFileData, DWORD(s), TIME_ONESHOT);
 				}
 			}
+			//ack = base: 3次冗余ack，快速重传base
+			else if (senderMessage.ack > socketPacket[s][socketSendBase[s]].seq) {
+				redundancy++;
+				if (redundancy == 3) {
+					sendto(s, (char *)(&socketPacket[s][socketSendBase[s]]), sizeof(packet), 0, (SOCKADDR *)&(socketClientAddr[s]), sizeof(socketClientAddr[s]));
+				}
+			}
+			//ack < base：base之前的包都已经被确认，因此不用响应小于base的ack
+		}
+	}
+	file.close();
+	while (socketSendBase[s] != nextseqnum) {
+		if (recvfrom(s, (char *)&senderMessage, sizeof(senderMessage), 0, (SOCKADDR *)&clientAddr, NULL) != -1) {
+			//防止错误的IP/端口发来的信息
+			if (clientAddr.sin_addr.s_addr != socketClientAddr[s].sin_addr.s_addr ||
+				clientAddr.sin_port != socketClientAddr[s].sin_port) {
+				continue;
+			}
+			//ack > base: ack之前的都被确认，因此base = ack
+			if (senderMessage.ack > socketPacket[s][socketSendBase[s]].seq) {
+				socketTimeOut[s].first = 2000;
+				socketSendBase[s] = (socketSendBase[s] + senderMessage.ack - socketPacket[s][socketSendBase[s]].seq) % 1001;
+				redundancy = 0;
+				timeKillEvent(socketTimeOut[s].second);
+				if (socketSendBase[s] != nextseqnum) {
+					socketTimeOut[s].second = timeSetEvent(socketTimeOut[s].first, 1, (LPTIMECALLBACK)resendFileData, DWORD(s), TIME_ONESHOT);
+				}
+			}
+			//ack = base: 3次冗余ack，快速重传base
+			else if (senderMessage.ack > socketPacket[s][socketSendBase[s]].seq) {
+				redundancy++;
+				if (redundancy == 3) {
+					sendto(s, (char *)(&socketPacket[s][socketSendBase[s]]), sizeof(packet), 0, (SOCKADDR *)&(socketClientAddr[s]), sizeof(socketClientAddr[s]));
+				}
+			}
+			//ack < base：base之前的包都已经被确认，因此不用响应小于base的ack
 		}
 	}
 
-
-
+	closeSocket(s);
 	return 0;
 }
 /**************************************/
