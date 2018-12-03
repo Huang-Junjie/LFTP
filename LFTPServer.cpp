@@ -11,6 +11,11 @@ using namespace std;
 
 
 /****************全局变量**************/
+SOCKET listenSocket;
+sockaddr_in serverAddr; //服务器监听地址信息
+sockaddr_in clientAddr; //客户端地址
+int addrLen = sizeof(sockaddr_in);    
+sockaddr_in portzeroAddr; //用于创建线程socket时的bind，当port为0时，系统自动分配port
 //客户端地址端口对应的socket
 unordered_map<unsigned long, unordered_map<unsigned short, SOCKET>> clientSocket; 
 //socket对应的客户端地址端口
@@ -47,6 +52,7 @@ void closeSocket(SOCKET s) {
 	socketTimeOut.erase(s);
 	socketSendBase.erase(s);
 	socketPacket.erase(s);
+	closesocket(s);
 }
 /***************************************************/
 
@@ -65,6 +71,12 @@ void WINAPI resendFilePathRequire(UINT wTimerID, UINT msg, DWORD dwUser, DWORD d
 	sendto(s, "filePath", 8, 0, (SOCKADDR *)&(socketClientAddr[s]), sizeof(socketClientAddr[s]));
 	socketTimeOut[s].first *= 2;
 	socketTimeOut[s].second = timeSetEvent(socketTimeOut[s].first, 1, (LPTIMECALLBACK)resendFilePathRequire, DWORD(s), TIME_ONESHOT);
+}
+
+void WINAPI closeThread(UINT wTimerID, UINT msg, DWORD dwUser, DWORD dwl, DWORD dw2) {
+	SOCKET s = dwUser;
+	TerminateThread(socketThread[s], 0);
+	closeSocket(s);
 }
 
 void WINAPI resendFileData(UINT wTimerID, UINT msg, DWORD dwUser, DWORD dwl, DWORD dw2) {
@@ -107,9 +119,8 @@ DWORD WINAPI getFileFromClient(LPVOID lpParameter) {
 
 DWORD WINAPI sendFileToClient(LPVOID lpParameter) {
 	SOCKET s = *((SOCKET *)lpParameter);
-	//响应客户端的请求，并且询问要发送的文件路径
-	sendto(s, "filePath", 8, 0, (SOCKADDR *)&(socketClientAddr[s]), sizeof(socketClientAddr[s]));
-	socketTimeOut[s].second = timeSetEvent(socketTimeOut[s].first, 1, (LPTIMECALLBACK)resendFilePathRequire, DWORD(s), TIME_ONESHOT);
+	//等待客户端发送文件路径, 1分钟未响应，关闭该线程，并清空对应的数据
+	socketTimeOut[s].second = timeSetEvent(socketTimeOut[s].first, 1, (LPTIMECALLBACK)closeThread, DWORD(s), TIME_ONESHOT);
 	sockaddr_in clientAddr;
 	char filePath[301];
 	int clientAddrLen = sizeof(clientAddr);
@@ -264,39 +275,30 @@ int main(int argc, char* argv[]) {
 	}
 
 	//创建监听socket
-	SOCKET listenSocket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+	listenSocket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
 	if (listenSocket == INVALID_SOCKET) {
 		cout << "socket create failed!" << endl;
 		return 0;
 	}
 
-	//服务器地址信息
-	sockaddr_in serverAddr;
 	serverAddr.sin_family = AF_INET;
 	serverAddr.sin_addr.s_addr = INADDR_ANY;
 	serverAddr.sin_port = htons(8021);
-	int serveraddrLen = sizeof(serverAddr);
 
-	if (bind(listenSocket, (SOCKADDR *)&serverAddr, serveraddrLen) == SOCKET_ERROR) {
+	portzeroAddr.sin_family = AF_INET;
+	portzeroAddr.sin_addr.s_addr = INADDR_ANY;
+	portzeroAddr.sin_port = 0;
+
+	if (bind(listenSocket, (SOCKADDR *)&serverAddr, addrLen) == SOCKET_ERROR) {
 		cout << "bind listenSocket failed!";
 		closesocket(listenSocket);
 		return 0;
 	}
 	cout << "begin listen at port 8021" << endl;
 
-	//客户端地址
-	sockaddr_in clientAddr;
-	int clientAddrLen = sizeof(clientAddr);
-
-	//用于创建socket时的bind，当port为0时，系统自动分配port
-	sockaddr_in newAddr;
-	newAddr.sin_family = AF_INET;
-	newAddr.sin_addr.s_addr = INADDR_ANY;
-	newAddr.sin_port = 0;
-
 	unsigned long clientIP;
 	unsigned short clientPort;
-	
+	sockaddr_in newAddr;
 	/**
 		监听客户端的请求；
 		当listenSocket收到一个新的客户端IP/PORT的请求报文时，
@@ -307,7 +309,7 @@ int main(int argc, char* argv[]) {
 	**/
 	char require[5];
 	while (true) {
-		if (recvfrom(listenSocket, require, 5, 0, (SOCKADDR *)&clientAddr, &clientAddrLen) != -1) {
+		if (recvfrom(listenSocket, require, 5, 0, (SOCKADDR *)&clientAddr, &addrLen) != -1) {
 			if (strncmp(require, "lsend", 5) != 0 && strncmp(require, "lget", 4) != 0) {
 				continue;
 			}
@@ -320,9 +322,14 @@ int main(int argc, char* argv[]) {
 				clientSocket[clientIP][clientPort] == 0) {
 				//创建socket
 				SOCKET s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-				if (bind(s, (SOCKADDR *)&newAddr, sizeof(newAddr)) == SOCKET_ERROR) {
+				if (bind(s, (SOCKADDR *)&portzeroAddr, sizeof(portzeroAddr)) == SOCKET_ERROR) {
 					cout << "create socket failed for: (" << clientIP << ", " << clientPort << ")" << endl;
+					closesocket(s);
 					continue;
+				}
+				else {
+					getsockname(s, (SOCKADDR *)&newAddr, &addrLen);
+					sendto(listenSocket, (char *)&newAddr, sizeof(newAddr), 0, (SOCKADDR *)&clientAddr, addrLen);
 				}
 				cout << "create socket succeed for: (" << clientIP << ", " << clientPort << ")" << endl;
 				//添加全局变量map信息

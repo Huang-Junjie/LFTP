@@ -12,10 +12,12 @@ using namespace std;
 /***************全局变量****************************/
 unsigned int timeOut = 2000;		//初始时timeOut定为2s
 unsigned int timeOutId;
-sockaddr_in serverAddr;	
+sockaddr_in serverListenAddr;	
+sockaddr_in serverDataAddr;
 int serveraddrLen;
 SOCKET s;
-char* filePath;
+char * filePath;
+char * serverIp;
 //数据包结构体
 struct packet {
 	unsigned int seq;
@@ -40,7 +42,7 @@ void WINAPI resendGetRequire(UINT wTimerID, UINT msg, DWORD dwUser, DWORD dwl, D
 		exit(0);
 	}
 	cout << "request timeout, resent lget request" << endl;
-	sendto(s, "lget", 4, 0, (SOCKADDR *)&serverAddr, serveraddrLen);
+	sendto(s, "lget", 4, 0, (SOCKADDR *)&serverListenAddr, serveraddrLen);
 	timeOut *= 2;
 	timeOutId = timeSetEvent(timeOut, 1, (LPTIMECALLBACK)resendGetRequire, DWORD(1), TIME_ONESHOT);
 }
@@ -51,7 +53,7 @@ void WINAPI resendSendRequire(UINT wTimerID, UINT msg, DWORD dwUser, DWORD dwl, 
 		exit(0);
 	}
 	cout << "request timeout, resent lsend request" << endl;
-	sendto(s, "lsend", 4, 0, (SOCKADDR *)&serverAddr, serveraddrLen);
+	sendto(s, "lsend", 4, 0, (SOCKADDR *)&serverListenAddr, serveraddrLen);
 	timeOut *= 2;
 	timeOutId = timeSetEvent(timeOut, 1, (LPTIMECALLBACK)resendSendRequire, DWORD(1), TIME_ONESHOT);
 }
@@ -62,14 +64,14 @@ void WINAPI resendFilePath(UINT wTimerID, UINT msg, DWORD dwUser, DWORD dwl, DWO
 		exit(0);
 	}
 	cout << "timeout, resent file path" << endl;
-	sendto(s, filePath, strlen(filePath) + 1, 0, (SOCKADDR *)&serverAddr, serveraddrLen);
+	sendto(s, filePath, strlen(filePath) + 1, 0, (SOCKADDR *)&serverDataAddr, serveraddrLen);
 	timeOut *= 2;
-	timeOutId = timeSetEvent(timeOut, 1, (LPTIMECALLBACK)resendSendRequire, DWORD(1), TIME_ONESHOT);
+	timeOutId = timeSetEvent(timeOut, 1, (LPTIMECALLBACK)resendFilePath, DWORD(1), TIME_ONESHOT);
 }
 
 void WINAPI disconnect(UINT wTimerID, UINT msg, DWORD dwUser, DWORD dwl, DWORD dw2) {
 	cout << "file transfer abort, disconnect from the server!" << endl;
-	sendto(s, "FIN", 3, 0, (SOCKADDR *)&serverAddr, serveraddrLen);
+	sendto(s, "FIN", 3, 0, (SOCKADDR *)&serverDataAddr, serveraddrLen);
 	exit(0);
 }
 /**************************************************/
@@ -82,6 +84,7 @@ int main(int argc, char* argv[]) {
 		return 0;
 	}
 	filePath = argv[3];
+	serverIp = argv[2];
 
 	//初始化Winsock相关的ddl
 	WSAData wsa;
@@ -97,12 +100,12 @@ int main(int argc, char* argv[]) {
 	}
 
 	//服务器地址信息
-	serverAddr.sin_family = AF_INET;
-	serverAddr.sin_addr.s_addr = inet_addr(argv[2]);
-	serverAddr.sin_port = htons(8021);
-	serveraddrLen = sizeof(serverAddr);
+	serverListenAddr.sin_family = AF_INET;
+	serverListenAddr.sin_addr.s_addr = inet_addr(argv[2]);
+	serverListenAddr.sin_port = htons(8021);
+	serveraddrLen = sizeof(serverListenAddr);
 
-	//客户端
+	//用于客户端socket的bind，当port为0时，系统自动分配port
 	sockaddr_in clientAddr;
 	clientAddr.sin_family = AF_INET;
 	clientAddr.sin_addr.s_addr = INADDR_ANY;
@@ -148,27 +151,22 @@ int main(int argc, char* argv[]) {
 	//下载文件
 	else if (strncmp(argv[1], "lget", 4) == 0) {
 		//向服务器发送请求
-		char response[8];
-		sendto(s, "lget", 4, 0, (SOCKADDR *)&serverAddr, serveraddrLen);
+		sendto(s, "lget", 4, 0, (SOCKADDR *)&serverListenAddr, serveraddrLen);
 		timeOutId = timeSetEvent(timeOut, 1, (LPTIMECALLBACK)resendGetRequire, DWORD(1), TIME_ONESHOT);
-		if (recvfrom(s, response, 8, 0, (SOCKADDR *)&serverAddr, &serveraddrLen) != -1) {
+
+		//获得服务器为客户端创建的socket地址，向该socket发送要下载的文件路径
+		if (recvfrom(s, (char *)&serverDataAddr, sizeof(serverDataAddr), 0, NULL, NULL) != -1) {
+			cout << "connect server succeed!" << endl;
 			timeKillEvent(timeOutId);
-			if (strncmp(response, "filePath", 8) == 0) {
-				cout << "connect server succeed！" << endl;
-			}
-			else {
-				cout << "get an incorrect response!" << endl;
-				return 0;
-			}
+			serverDataAddr.sin_addr.s_addr = inet_addr(serverIp);
+			sendto(s, filePath, strlen(filePath) + 1, 0, (SOCKADDR *)&serverDataAddr, sizeof(serverDataAddr));
+			timeOutId = timeSetEvent(timeOut, 1, (LPTIMECALLBACK)resendFilePath, DWORD(1), TIME_ONESHOT);
 		}
 		else {
-			cout << "get an incorrect response!" << endl;
+			cout << "connect server failed!" << endl;
 			return 0;
 		}
-		//向服务器发送要下载的文件路径
-		sendto(s, filePath, strlen(filePath) + 1, 0, (SOCKADDR *)&serverAddr, serveraddrLen);
-		timeOutId = timeSetEvent(timeOut, 1, (LPTIMECALLBACK)resendFilePath, DWORD(1), TIME_ONESHOT);
-
+	
 		//创建文件
 		ofstream file(filePath, ios_base::out | ios_base::binary);
 		if (!file) {
@@ -188,8 +186,8 @@ int main(int argc, char* argv[]) {
 		while (true) {
 			if (recvfrom(s, (char *)&rcvPacket, sizeof(packet), 0, (SOCKADDR *)&recvfromAddr, &serveraddrLen) != -1) {
 				//防止错误的IP/端口发来的信息
-				if (recvfromAddr.sin_addr.s_addr != serverAddr.sin_addr.s_addr ||
-					recvfromAddr.sin_port != serverAddr.sin_port) {
+				if (recvfromAddr.sin_addr.s_addr != serverDataAddr.sin_addr.s_addr ||
+					recvfromAddr.sin_port != serverDataAddr.sin_port) {
 					continue;
 				}
 				//过滤之前的重复的filePath请求包
@@ -202,7 +200,7 @@ int main(int argc, char* argv[]) {
 				if (strncmp((char *)&rcvPacket, "FIN", 3) == 0) {
 					file.close();
 					cout << "download file succeed!" << endl;
-					sendto(s, "FIN", 3, 0, (SOCKADDR *)&serverAddr, serveraddrLen);
+					sendto(s, "FIN", 3, 0, (SOCKADDR *)&serverDataAddr, serveraddrLen);
 					return 0;
 				}
 
@@ -219,13 +217,13 @@ int main(int argc, char* argv[]) {
 					//发送冗余ack
 					ackMessage.ack = expectSeq;
 					ackMessage.rwnd = 1000 - (lastRcvSeq + 1 - expectSeq);
-					sendto(s, (char *)&ackMessage, sizeof(ackMessage), 0, (SOCKADDR *)&serverAddr, serveraddrLen);
+					sendto(s, (char *)&ackMessage, sizeof(ackMessage), 0, (SOCKADDR *)&serverDataAddr, serveraddrLen);
 				}
 				//比期望序号小的报文
 				else if (rcvPacket.seq < expectSeq){
 					ackMessage.ack = expectSeq;
 					ackMessage.rwnd = 1000 - (lastRcvSeq + 1 - expectSeq );
-					sendto(s, (char *)&ackMessage, sizeof(ackMessage), 0, (SOCKADDR *)&serverAddr, serveraddrLen);
+					sendto(s, (char *)&ackMessage, sizeof(ackMessage), 0, (SOCKADDR *)&serverDataAddr, serveraddrLen);
 				}
 				else {
 					if (rcvPacket.seq > lastRcvSeq) lastRcvSeq = rcvPacket.seq;
@@ -243,7 +241,7 @@ int main(int argc, char* argv[]) {
 					//发送ack
 					ackMessage.ack = expectSeq;
 					ackMessage.rwnd = 1000 - (lastRcvSeq + 1 - expectSeq );
-					sendto(s, (char *)&ackMessage, sizeof(ackMessage), 0, (SOCKADDR *)&serverAddr, serveraddrLen);
+					sendto(s, (char *)&ackMessage, sizeof(ackMessage), 0, (SOCKADDR *)&serverDataAddr, serveraddrLen);
 				}
 				cout << "send ack: " << ackMessage.ack << endl;
 			}
