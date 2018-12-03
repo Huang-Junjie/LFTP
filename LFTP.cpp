@@ -2,15 +2,15 @@
 #include <fstream>
 #include <WinSock2.h>
 #include <Windows.h>
+#include <chrono>
 #pragma comment(lib, "Ws2_32.lib")
 #pragma comment(lib, "Winmm.lib")
-
 using namespace std;
-
+using namespace chrono;
 
 
 /***************全局变量****************************/
-unsigned int timeOut = 2000;		//初始时timeOut定为2s
+unsigned int timeOut = 1000;		//初始时timeOut定为1s
 unsigned int timeOutId;
 sockaddr_in serverListenAddr;	
 sockaddr_in serverDataAddr;
@@ -23,32 +23,50 @@ struct packet {
 	unsigned int seq;
 	unsigned int buffDataLen;
 	char buff[1024];
+	long long timestamp;
 };
-//ack包结构体,含ack和接收窗口大小
+//ack包结构体
 struct ackpacket {
 	unsigned int ack;
 	unsigned int rwnd;
+	unsigned resDelay;
+	long long timestamp;
 };
 packet rcvBuff[1000];
 bool ifVaildData[1000] = { false };
 int udpRcvBuffSize = 1000 * sizeof(packet);
+struct {
+	char req[8];
+	long long timestamp;
+} message;
+
+struct {
+	sockaddr_in addr;
+	long long timestamp;
+} res;
 /**************************************************/
 
 
 /*********************定时器回调函数********************/
 void WINAPI resendGetRequire(UINT wTimerID, UINT msg, DWORD dwUser, DWORD dwl, DWORD dw2) {
-	if (timeOut > 60000) {
+	if (timeOut > 30000) {
 		cout << "connect server failed!" << endl;
 		exit(0);
 	}
 	cout << "request timeout, resent lget request" << endl;
-	sendto(s, "lget", 4, 0, (SOCKADDR *)&serverListenAddr, serveraddrLen);
+	struct {
+		char req[8];
+		unsigned int timestamp;
+	} message;
+	memcpy((char *)&message.req, "lget", 4);
+	message.timestamp = duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
+	sendto(s, (char *)&message, sizeof(message), 0, (SOCKADDR *)&serverListenAddr, serveraddrLen);
 	timeOut *= 2;
 	timeOutId = timeSetEvent(timeOut, 1, (LPTIMECALLBACK)resendGetRequire, DWORD(1), TIME_ONESHOT);
 }
 
 void WINAPI resendSendRequire(UINT wTimerID, UINT msg, DWORD dwUser, DWORD dwl, DWORD dw2) {
-	if (timeOut > 60000) {
+	if (timeOut > 30000) {
 		cout << "connect server failed!" << endl;
 		exit(0);
 	}
@@ -59,7 +77,7 @@ void WINAPI resendSendRequire(UINT wTimerID, UINT msg, DWORD dwUser, DWORD dwl, 
 }
 
 void WINAPI resendFilePath(UINT wTimerID, UINT msg, DWORD dwUser, DWORD dwl, DWORD dw2) {
-	if (timeOut > 60000) {
+	if (timeOut > 30000) {
 		cout << "disconnect from the server!" << endl;
 		exit(0);
 	}
@@ -151,15 +169,20 @@ int main(int argc, char* argv[]) {
 	//下载文件
 	else if (strncmp(argv[1], "lget", 4) == 0) {
 		//向服务器发送请求
-		sendto(s, "lget", 4, 0, (SOCKADDR *)&serverListenAddr, serveraddrLen);
+		memcpy((char *)&message.req, "lget", 4);
+		message.timestamp = duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
+		sendto(s, (char *)&message, sizeof(message), 0, (SOCKADDR *)&serverListenAddr, serveraddrLen);
 		timeOutId = timeSetEvent(timeOut, 1, (LPTIMECALLBACK)resendGetRequire, DWORD(1), TIME_ONESHOT);
 
 		//获得服务器为客户端创建的socket地址，向该socket发送要下载的文件路径
-		if (recvfrom(s, (char *)&serverDataAddr, sizeof(serverDataAddr), 0, NULL, NULL) != -1) {
+		if (recvfrom(s, (char *)&res, sizeof(res), 0, NULL, NULL) != -1) {
 			cout << "connect server succeed!" << endl;
 			timeKillEvent(timeOutId);
+			memcpy((char *)&serverDataAddr, (char *)&res.addr, sizeof(serverDataAddr));
 			serverDataAddr.sin_addr.s_addr = inet_addr(serverIp);
 			sendto(s, filePath, strlen(filePath) + 1, 0, (SOCKADDR *)&serverDataAddr, sizeof(serverDataAddr));
+			timeOut = duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count() - res.timestamp;
+			timeOut *= 4;
 			timeOutId = timeSetEvent(timeOut, 1, (LPTIMECALLBACK)resendFilePath, DWORD(1), TIME_ONESHOT);
 		}
 		else {
@@ -190,10 +213,7 @@ int main(int argc, char* argv[]) {
 					recvfromAddr.sin_port != serverDataAddr.sin_port) {
 					continue;
 				}
-				//过滤之前的重复的filePath请求包
-				if (strncmp((char *)&rcvPacket, "filePath", 8) == 0) {
-					continue;
-				}
+
 				timeKillEvent(timeOutId);
 
 				//判断是不是挥手报文
@@ -215,12 +235,16 @@ int main(int argc, char* argv[]) {
 					memcpy((void *)&(rcvBuff[index]), (void *)&rcvPacket, sizeof(packet));
 					ifVaildData[index] == true;
 					//发送冗余ack
+					ackMessage.resDelay = duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count() - rcvPacket.timestamp;
+					ackMessage.timestamp = duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
 					ackMessage.ack = expectSeq;
 					ackMessage.rwnd = 1000 - (lastRcvSeq + 1 - expectSeq);
 					sendto(s, (char *)&ackMessage, sizeof(ackMessage), 0, (SOCKADDR *)&serverDataAddr, serveraddrLen);
 				}
 				//比期望序号小的报文
 				else if (rcvPacket.seq < expectSeq){
+					ackMessage.resDelay = duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count() - rcvPacket.timestamp;
+					ackMessage.timestamp = duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
 					ackMessage.ack = expectSeq;
 					ackMessage.rwnd = 1000 - (lastRcvSeq + 1 - expectSeq );
 					sendto(s, (char *)&ackMessage, sizeof(ackMessage), 0, (SOCKADDR *)&serverDataAddr, serveraddrLen);
@@ -239,6 +263,8 @@ int main(int argc, char* argv[]) {
 					}
 					cout << rcvBytes << "bytes have been received so far" << endl;
 					//发送ack
+					ackMessage.resDelay = duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count() - rcvPacket.timestamp;
+					ackMessage.timestamp = duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
 					ackMessage.ack = expectSeq;
 					ackMessage.rwnd = 1000 - (lastRcvSeq + 1 - expectSeq );
 					sendto(s, (char *)&ackMessage, sizeof(ackMessage), 0, (SOCKADDR *)&serverDataAddr, serveraddrLen);
