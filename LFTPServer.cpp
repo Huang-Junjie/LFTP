@@ -1,6 +1,7 @@
 ﻿#include <iostream>
 #include <fstream>
 #include <unordered_map>
+#include <vector>
 #include <WinSock2.h>
 #pragma comment(lib,"Ws2_32.lib")
 #pragma comment(lib, "Winmm.lib")
@@ -119,13 +120,20 @@ DWORD WINAPI sendFileToClient(LPVOID lpParameter) {
 		//防止错误的IP/端口发来的信息
 		if (clientAddr.sin_addr.s_addr != socketClientAddr[s].sin_addr.s_addr ||
 			clientAddr.sin_port != socketClientAddr[s].sin_port) {
-			cout << "get message from error address: (";
-			cout << socketClientAddr[s].sin_addr.s_addr << ", " << socketClientAddr[s].sin_port << ")" << endl;
+			cout << "get message from error address, ";
 			cout << "disconnect client: (";
 			cout << socketClientAddr[s].sin_addr.s_addr << ", " << socketClientAddr[s].sin_port << ")" << endl;
 			closeSocket(s);
 			return 0;
 		}
+	}
+	else {
+		timeKillEvent(socketTimeOut[s].second);
+		cout << "get message from error address, ";
+		cout << "disconnect client: (";
+		cout << socketClientAddr[s].sin_addr.s_addr << ", " << socketClientAddr[s].sin_port << ")" << endl;
+		closeSocket(s);
+		return 0;
 	}
 	//打开文件
 	ifstream file(filePath, ios_base::in | ios_base::binary);
@@ -224,6 +232,8 @@ DWORD WINAPI sendFileToClient(LPVOID lpParameter) {
 		}
 	}
 	//发送挥手报文
+	cout << "file transfer succeed for: (";
+	cout << socketClientAddr[s].sin_addr.s_addr << ", " << socketClientAddr[s].sin_port << ")" << endl;
 	sendto(s, "FIN", 3, 0, (SOCKADDR *)&(socketClientAddr[s]), sizeof(socketClientAddr[s]));
 	socketTimeOut[s].second = timeSetEvent(socketTimeOut[s].first, 1, (LPTIMECALLBACK)resendFIN, DWORD(s), TIME_ONESHOT);
 	while (recvfrom(s, (char *)&senderMessage, sizeof(senderMessage), 0, (SOCKADDR *)&clientAddr, &clientAddrLen) != -1) {
@@ -233,6 +243,7 @@ DWORD WINAPI sendFileToClient(LPVOID lpParameter) {
 		}
 	}
 	//断开连接
+	timeKillEvent(socketTimeOut[s].second);
 	cout << "disconnect from the client: (";
 	cout << socketClientAddr[s].sin_addr.s_addr << ", " << socketClientAddr[s].sin_port << ")" << endl;
 	closeSocket(s);

@@ -79,6 +79,7 @@ int main(int argc, char* argv[]) {
 	//检查参数
 	if (argc != 4) {
 		cout << "Please input: LFTP {lsend | lget} <myserver> <mylargefile>" << endl;
+		return 0;
 	}
 	filePath = argv[3];
 
@@ -153,12 +154,16 @@ int main(int argc, char* argv[]) {
 		if (recvfrom(s, response, 8, 0, (SOCKADDR *)&serverAddr, &serveraddrLen) != -1) {
 			timeKillEvent(timeOutId);
 			if (strncmp(response, "filePath", 8) == 0) {
-				cout << "连接服务器成功！" << endl;
+				cout << "connect server succeed！" << endl;
 			}
 			else {
 				cout << "get an incorrect response!" << endl;
 				return 0;
 			}
+		}
+		else {
+			cout << "get an incorrect response!" << endl;
+			return 0;
 		}
 		//向服务器发送要下载的文件路径
 		sendto(s, filePath, strlen(filePath) + 1, 0, (SOCKADDR *)&serverAddr, serveraddrLen);
@@ -240,7 +245,7 @@ int main(int argc, char* argv[]) {
 					ackMessage.rwnd = 1000 - (lastRcvSeq + 1 - expectSeq );
 					sendto(s, (char *)&ackMessage, sizeof(ackMessage), 0, (SOCKADDR *)&serverAddr, serveraddrLen);
 				}
-				cout << "send ack: " <<ackMessage.ack << endl;
+				cout << "send ack: " << ackMessage.ack << endl;
 			}
 		}
 	}
