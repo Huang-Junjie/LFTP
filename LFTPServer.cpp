@@ -373,7 +373,7 @@ DWORD WINAPI getFileFromClient(LPVOID lpParameter) {
 				if (rcvPacket.seq > lastRcvSeq) lastRcvSeq = rcvPacket.seq;
 				unsigned int index = (socketSendBase[s] + rcvPacket.seq - expectSeq) % 1000;
 				memcpy((void *)&(socketPacket[s][index]), (void *)&rcvPacket, sizeof(packet));
-				ifVaildData[s][index] == true;
+				ifVaildData[s][index] = true;
 				//发送冗余ack
 				ackMessage.ack = expectSeq;
 				ackMessage.rwnd = 1000 - (lastRcvSeq + 1 - expectSeq);

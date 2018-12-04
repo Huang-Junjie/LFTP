@@ -386,7 +386,7 @@ int main(int argc, char* argv[]) {
 					if (rcvPacket.seq > lastRcvSeq) lastRcvSeq = rcvPacket.seq;
 					unsigned int index = (rcvBase + rcvPacket.seq - expectSeq) % 1000;
 					memcpy((void *)&(packetBuff[index]), (void *)&rcvPacket, sizeof(packet));
-					ifVaildData[index] == true;
+					ifVaildData[index] = true;
 					//发送冗余ack
 					ackMessage.ack = expectSeq;
 					ackMessage.rwnd = 1000 - (lastRcvSeq + 1 - expectSeq);
