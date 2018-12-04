@@ -3,12 +3,9 @@
 #include <unordered_map>
 #include <vector>
 #include <WinSock2.h>
-#include <Windows.h>
-#include <chrono>
 #pragma comment(lib,"Ws2_32.lib")
 #pragma comment(lib, "Winmm.lib")
 using namespace std;
-using namespace chrono;
 
 
 
@@ -34,19 +31,22 @@ unordered_map<SOCKET, unsigned int> socketSendBase;
 unordered_map<SOCKET, float> cwnd;					
 unordered_map<SOCKET, int> ssthresh;
 unordered_map<SOCKET, int> redundancy;
+//判断该seq的包是否重发过，重发过则不用它对应的ack计算timeout
+unordered_map<SOCKET, unordered_map<unsigned int, bool>> ifResend;  
+//记录包的发送时间，用于接收ack时计算timeouut
+unordered_map<SOCKET, vector<DWORD>> sendtime;			
+//记录连续超时次数，每次将定时器时间翻倍，连续10次则视为断开连接，
+unordered_map<SOCKET, int> timeouttimes;
 //数据包结构体
 struct packet {
 	unsigned int seq;
 	unsigned int buffDataLen;
 	char buff[1024];
-	long long timestamp;
 };
 //ack包结构体
 struct ackpacket {
 	unsigned int ack;
 	unsigned int rwnd;
-	unsigned resDelay;
-	long long timestamp;
 };
 //每一个socket线程对应一个packet数组
 unordered_map<SOCKET, vector<packet>> socketPacket;
@@ -71,6 +71,9 @@ void closeSocket(SOCKET s) {
 	cwnd.erase(s);
 	ssthresh.erase(s);
 	redundancy.erase(s);
+	ifResend.erase(s);
+	sendtime.erase(s);
+	timeouttimes.erase(s);
 	closesocket(s);
 }
 
@@ -92,7 +95,7 @@ void WINAPI closeThread(UINT wTimerID, UINT msg, DWORD dwUser, DWORD dwl, DWORD 
 
 void WINAPI resendFileData(UINT wTimerID, UINT msg, DWORD dwUser, DWORD dwl, DWORD dw2) {
 	SOCKET s = dwUser;
-	if (socketTimeOut[s].first > 30000) {
+	if (timeouttimes[s] > 10) {
 		cout << "disconnect from the client: (";
 		cout << socketClientAddr[s].sin_addr.s_addr << ", " << socketClientAddr[s].sin_port << ")" << endl;
 		TerminateThread(socketThread[s], 0);
@@ -100,13 +103,13 @@ void WINAPI resendFileData(UINT wTimerID, UINT msg, DWORD dwUser, DWORD dwl, DWO
 		return;
 	}
 	cout << "timeout resend seq: " << socketPacket[s][socketSendBase[s]].seq << endl;
-	socketPacket[s][socketSendBase[s]].timestamp = duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
+	ifResend[s][socketPacket[s][socketSendBase[s]].seq] = true;
 	sendto(s, (char *)(&socketPacket[s][socketSendBase[s]]), sizeof(packet), 0, (SOCKADDR *)&(socketClientAddr[s]), sizeof(socketClientAddr[s]));
 	ssthresh[s] = cwnd[s] / 2;
 	cwnd[s] = 1;
 	redundancy[s] = 0;
-	socketTimeOut[s].first *= 2;
-	socketTimeOut[s].second = timeSetEvent(socketTimeOut[s].first, 1, (LPTIMECALLBACK)resendFileData, DWORD(s), TIME_ONESHOT);
+	timeouttimes[s]++;
+	socketTimeOut[s].second = timeSetEvent(socketTimeOut[s].first * (timeouttimes[s] + 1), 1, (LPTIMECALLBACK)resendFileData, DWORD(s), TIME_ONESHOT);
 }
 
 void WINAPI resendFIN(UINT wTimerID, UINT msg, DWORD dwUser, DWORD dwl, DWORD dw2) {
@@ -130,7 +133,7 @@ void WINAPI resendFIN(UINT wTimerID, UINT msg, DWORD dwUser, DWORD dwl, DWORD dw
 DWORD WINAPI sendFileToClient(LPVOID lpParameter) {
 	SOCKET s = *((SOCKET *)lpParameter);
 	//等待客户端发送文件路径, 未响应，关闭该线程，并清空对应的数据
-	socketTimeOut[s].second = timeSetEvent(10 * socketTimeOut[s].first, 1, (LPTIMECALLBACK)closeThread, DWORD(s), TIME_ONESHOT);
+	socketTimeOut[s].second = timeSetEvent(30000, 1, (LPTIMECALLBACK)closeThread, DWORD(s), TIME_ONESHOT);
 	sockaddr_in clientAddr;
 	char filePath[301];
 	int clientAddrLen = sizeof(clientAddr);
@@ -146,6 +149,9 @@ DWORD WINAPI sendFileToClient(LPVOID lpParameter) {
 			closeSocket(s);
 			return 0;
 		}
+		//初始化estimatedRTT和timeout
+		estimatedRTT[s] = GetTickCount() - sendtime[s][0];
+		socketTimeOut[s].first = 4 * estimatedRTT[s];
 	}
 	else {
 		timeKillEvent(socketTimeOut[s].second);
@@ -175,7 +181,7 @@ DWORD WINAPI sendFileToClient(LPVOID lpParameter) {
 	unsigned int nextseqnum = 0;
 	ackpacket ackMessage;
 	while (!file.eof()) {
-		while (!file.eof() && ((nextseqnum + 1001 - socketSendBase[s]) % 1001) < min(rwnd, cwnd[s])) {
+		while (!file.eof() && ((nextseqnum + 1000 - socketSendBase[s]) % 1000) < (rwnd < cwnd[s] ? rwnd : cwnd[s])) {
 			if (socketSendBase[s] == nextseqnum) {
 				socketTimeOut[s].second = timeSetEvent(2000, 1, (LPTIMECALLBACK)resendFileData, DWORD(s), TIME_ONESHOT);
 			}
@@ -183,10 +189,10 @@ DWORD WINAPI sendFileToClient(LPVOID lpParameter) {
 			socketPacket[s][nextseqnum].buffDataLen = file.gcount();
 			if (socketPacket[s][nextseqnum].buffDataLen == 0) continue;
 			socketPacket[s][nextseqnum].seq = seq;
-			socketPacket[s][nextseqnum].timestamp = duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
+			sendtime[s][nextseqnum] = GetTickCount();
 			sendto(s, (char *)(&socketPacket[s][nextseqnum]), sizeof(packet), 0, (SOCKADDR *)&(socketClientAddr[s]), sizeof(socketClientAddr[s]));
 			cout << "send seq: " << seq << endl;
-			nextseqnum = (nextseqnum + 1) % 1001;
+			nextseqnum = (nextseqnum + 1) % 1000;
 			seq++;
 		}
 		if (recvfrom(s, (char *)&ackMessage, sizeof(ackMessage), 0, (SOCKADDR *)&clientAddr, &clientAddrLen) != -1) {
@@ -198,32 +204,33 @@ DWORD WINAPI sendFileToClient(LPVOID lpParameter) {
 
 			//防止重传的filePath消息
 			if (ackMessage.ack > seq) continue;
-
+			timeouttimes[s] = 0;
 			rwnd = ackMessage.rwnd;
 			cout << "smallest unAcked seq: " << socketPacket[s][socketSendBase[s]].seq << " receive ack: " << ackMessage.ack << endl;
 			//ack > base: ack之前的都被确认，因此base = ack
 			if (ackMessage.ack > socketPacket[s][socketSendBase[s]].seq) {
-				socketTimeOut[s].first = calculateTimeOut(estimatedRTT[s], DevRTT[s],
-													duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count()
-													- ackMessage.timestamp + ackMessage.resDelay);
+				timeKillEvent(socketTimeOut[s].second);
+				//计算timeout
+				if (ackMessage.ack == socketPacket[s][socketSendBase[s]].seq + 1) {
+					//确保时间差是真正的RTT，因此需满足未重发和ack==seq+1
+					if (ifResend[s].count(socketPacket[s][socketSendBase[s]].seq) == 0 || !ifResend[s][socketPacket[s][socketSendBase[s]].seq])
+						socketTimeOut[s].first = calculateTimeOut(estimatedRTT[s], DevRTT[s], GetTickCount() - sendtime[s][socketSendBase[s]]);
+					cout << "timeout = " << socketTimeOut[s].first << "ms" << endl;
+				}
 				if (cwnd[s] >= ssthresh[s]) cwnd[s] = cwnd[s] + 1.0 / cwnd[s];
 				else cwnd[s]++;
 				if (redundancy[s] >= 3) cwnd[s] = ssthresh[s];
 				redundancy[s] = 0;
-				socketSendBase[s] = (socketSendBase[s] + ackMessage.ack - socketPacket[s][socketSendBase[s]].seq) % 1001;
-				timeKillEvent(socketTimeOut[s].second);
+				socketSendBase[s] = (socketSendBase[s] + ackMessage.ack - socketPacket[s][socketSendBase[s]].seq) % 1000;
 				if (socketSendBase[s] != nextseqnum) {
 					socketTimeOut[s].second = timeSetEvent(socketTimeOut[s].first, 1, (LPTIMECALLBACK)resendFileData, DWORD(s), TIME_ONESHOT);
 				}
 			}
 			//ack = base: 3次冗余ack，快速重传base
 			else if (ackMessage.ack == socketPacket[s][socketSendBase[s]].seq) {
-				socketTimeOut[s].first = calculateTimeOut(estimatedRTT[s], DevRTT[s],
-													duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count()
-													- ackMessage.timestamp + ackMessage.resDelay);
 				redundancy[s]++;
 				if (redundancy[s] == 3) {
-					socketPacket[s][socketSendBase[s]].timestamp = duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
+					ifResend[s][socketPacket[s][socketSendBase[s]].seq] = true;
 					sendto(s, (char *)(&socketPacket[s][socketSendBase[s]]), sizeof(packet), 0, (SOCKADDR *)&(socketClientAddr[s]), sizeof(socketClientAddr[s]));
 					cout << "quik resend seq: " << socketPacket[s][socketSendBase[s]].seq << endl;
 					ssthresh[s] = cwnd[s] / 2;
@@ -247,32 +254,33 @@ DWORD WINAPI sendFileToClient(LPVOID lpParameter) {
 
 			//防止重传的filePath消息
 			if (ackMessage.ack > seq) continue;
-
+			timeouttimes[s] = 0;
 			rwnd = ackMessage.rwnd;
 			cout << "smallest unAcked seq: " << socketPacket[s][socketSendBase[s]].seq << " receive ack: " << ackMessage.ack << endl;
 			//ack > base: ack之前的都被确认，因此base = ack
 			if (ackMessage.ack > socketPacket[s][socketSendBase[s]].seq) {
-				socketTimeOut[s].first = calculateTimeOut(estimatedRTT[s], DevRTT[s],
-					duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count()
-					- ackMessage.timestamp + ackMessage.resDelay);
+				timeKillEvent(socketTimeOut[s].second);
+				//计算timeout
+				if (ackMessage.ack == socketPacket[s][socketSendBase[s]].seq + 1) {
+					//确保时间差是真正的RTT，因此需满足未重发和ack==seq+1
+					if (ifResend[s].count(socketPacket[s][socketSendBase[s]].seq) == 0 || !ifResend[s][socketPacket[s][socketSendBase[s]].seq])
+						socketTimeOut[s].first = calculateTimeOut(estimatedRTT[s], DevRTT[s], GetTickCount() - sendtime[s][socketSendBase[s]]);
+					cout << "timeout = " << socketTimeOut[s].first << "ms" << endl;
+				}
 				if (cwnd[s] >= ssthresh[s]) cwnd[s] = cwnd[s] + 1.0 / cwnd[s];
 				else cwnd[s]++;
 				if (redundancy[s] >= 3) cwnd[s] = ssthresh[s];
 				redundancy[s] = 0;
-				socketSendBase[s] = (socketSendBase[s] + ackMessage.ack - socketPacket[s][socketSendBase[s]].seq) % 1001;
-				timeKillEvent(socketTimeOut[s].second);
+				socketSendBase[s] = (socketSendBase[s] + ackMessage.ack - socketPacket[s][socketSendBase[s]].seq) % 1000;
 				if (socketSendBase[s] != nextseqnum) {
 					socketTimeOut[s].second = timeSetEvent(socketTimeOut[s].first, 1, (LPTIMECALLBACK)resendFileData, DWORD(s), TIME_ONESHOT);
 				}
 			}
 			//ack = base: 3次冗余ack，快速重传base
 			else if (ackMessage.ack == socketPacket[s][socketSendBase[s]].seq) {
-				socketTimeOut[s].first = calculateTimeOut(estimatedRTT[s], DevRTT[s],
-					duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count()
-					- ackMessage.timestamp + ackMessage.resDelay);
 				redundancy[s]++;
 				if (redundancy[s] == 3) {
-					socketPacket[s][socketSendBase[s]].timestamp = duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
+					ifResend[s][socketPacket[s][socketSendBase[s]].seq] = true;
 					sendto(s, (char *)(&socketPacket[s][socketSendBase[s]]), sizeof(packet), 0, (SOCKADDR *)&(socketClientAddr[s]), sizeof(socketClientAddr[s]));
 					cout << "quik resend seq: " << socketPacket[s][socketSendBase[s]].seq << endl;
 					ssthresh[s] = cwnd[s] / 2;
@@ -285,7 +293,7 @@ DWORD WINAPI sendFileToClient(LPVOID lpParameter) {
 			//ack < base：base之前的包都已经被确认，因此不用响应小于base的ack
 		}
 	}
-
+	timeKillEvent(socketTimeOut[s].second);
 	//发送挥手报文
 	cout << "file transfer succeed for: (";
 	cout << socketClientAddr[s].sin_addr.s_addr << ", " << socketClientAddr[s].sin_port << ")" << endl;
@@ -310,7 +318,7 @@ DWORD WINAPI sendFileToClient(LPVOID lpParameter) {
 DWORD WINAPI getFileFromClient(LPVOID lpParameter) {
 	SOCKET s = *((SOCKET *)lpParameter);
 	//等待客户端发送文件路径, 未响应，关闭该线程，并清空对应的数据
-	socketTimeOut[s].second = timeSetEvent(10 * socketTimeOut[s].first, 1, (LPTIMECALLBACK)closeThread, DWORD(s), TIME_ONESHOT);
+	socketTimeOut[s].second = timeSetEvent(30000, 1, (LPTIMECALLBACK)closeThread, DWORD(s), TIME_ONESHOT);
 	unsigned int expectSeq = 0;		//期待收到的报文的seq
 	unsigned int lastRcvSeq = 0;	//收到的报文的最大seq
 	sockaddr_in clientAddr;
@@ -386,16 +394,12 @@ DWORD WINAPI getFileFromClient(LPVOID lpParameter) {
 				memcpy((void *)&(socketPacket[s][index]), (void *)&rcvPacket, sizeof(packet));
 				ifVaildData[s][index] == true;
 				//发送冗余ack
-				ackMessage.resDelay = duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count() - rcvPacket.timestamp;
-				ackMessage.timestamp = duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
 				ackMessage.ack = expectSeq;
 				ackMessage.rwnd = 1000 - (lastRcvSeq + 1 - expectSeq);
 				sendto(s, (char *)&ackMessage, sizeof(ackMessage), 0, (SOCKADDR *)&socketClientAddr[s], sizeof(socketClientAddr[s]));
 			}
 			//比期望序号小的报文
 			else if (rcvPacket.seq < expectSeq) {
-				ackMessage.resDelay = duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count() - rcvPacket.timestamp;
-				ackMessage.timestamp = duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
 				ackMessage.ack = expectSeq;
 				ackMessage.rwnd = 1000 - (lastRcvSeq + 1 - expectSeq);
 				sendto(s, (char *)&ackMessage, sizeof(ackMessage), 0, (SOCKADDR *)&socketClientAddr[s], sizeof(socketClientAddr[s]));
@@ -412,8 +416,6 @@ DWORD WINAPI getFileFromClient(LPVOID lpParameter) {
 					expectSeq++;
 				}
 				//发送ack
-				ackMessage.resDelay = duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count() - rcvPacket.timestamp;
-				ackMessage.timestamp = duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
 				ackMessage.ack = expectSeq;
 				ackMessage.rwnd = 1000 - (lastRcvSeq + 1 - expectSeq);
 				sendto(s, (char *)&ackMessage, sizeof(ackMessage), 0, (SOCKADDR *)&socketClientAddr[s], sizeof(socketClientAddr[s]));
@@ -467,19 +469,11 @@ int main(int argc, char* argv[]) {
 **************************************************************************************************************/
 	unsigned long clientIP;
 	unsigned short clientPort;
-	struct {
-		char req[8];
-		long long timestamp;
-	} message;
-
-	struct {
-		sockaddr_in newAddr;
-		long long timestamp;
-	} res;
-
+	sockaddr_in newAddr;
+	char req[5];
 	while (true) {
-		if (recvfrom(listenSocket, (char *)&message, sizeof(message), 0, (SOCKADDR *)&clientAddr, &addrLen) != -1) {
-			if (strncmp(message.req, "lsend", 5) != 0 && strncmp(message.req, "lget", 4) != 0) {
+		if (recvfrom(listenSocket, req, 5, 0, (SOCKADDR *)&clientAddr, &addrLen) != -1) {
+			if (strncmp(req, "lsend", 5) != 0 && strncmp(req, "lget", 4) != 0) {
 				continue;
 			}
 			//获取客户端的IP, PORT
@@ -497,32 +491,33 @@ int main(int argc, char* argv[]) {
 					continue;
 				}
 				else {
-					getsockname(s, (SOCKADDR *)&(res.newAddr), &addrLen);
-					res.timestamp = duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
-					sendto(listenSocket, (char *)&res, sizeof(res), 0, (SOCKADDR *)&clientAddr, addrLen);
+					getsockname(s, (SOCKADDR *)&newAddr, &addrLen);
+					sendto(listenSocket, (char *)&newAddr, sizeof(newAddr), 0, (SOCKADDR *)&clientAddr, addrLen);
 				}
 				cout << "create socket succeed for: (" << clientIP << ", " << clientPort << ")" << endl;
 				//添加全局变量map信息
 				clientSocket[clientIP][clientPort] = s;
 				socketClientAddr[s] = clientAddr;
-				socketTimeOut[s] = make_pair(4 * (res.timestamp - message.timestamp), 0);
-				estimatedRTT[s] = 2 * (res.timestamp - message.timestamp);
+				socketPacket[s] = vector<packet>(1000);
+				socketTimeOut[s] = make_pair(1000, 0);
+				estimatedRTT[s] = 1000;
 				DevRTT[s] = 0;
 				socketSendBase[s] = 0;
+				timeouttimes[s] = 0;
 				//创建线程
-				if (strncmp(message.req, "lsend", 5) == 0) {
-					socketPacket[s] = vector<packet>(1000);
+				if (strncmp(req, "lsend", 5) == 0) {
 					ifVaildData[s] = vector<bool>(1000, false);
 					if (setsockopt(s, SOL_SOCKET, SO_RCVBUF, (const char *)&udpBuffSize, sizeof(udpBuffSize)) == SOCKET_ERROR) {
 						cout << "set udp rcvbuff failed!" << endl;
 					}
 					socketThread[s] = CreateThread(NULL, 0, getFileFromClient, (void *)&clientSocket[clientIP][clientPort], 0, NULL);
 				}
-				else if (strncmp(message.req, "lget", 4) == 0) {
-					socketPacket[s] = vector<packet>(1001);
+				else if (strncmp(req, "lget", 4) == 0) {
 					cwnd[s] = 1;
 					ssthresh[s] = 64;
 					redundancy[s] = 0;
+					sendtime[s] = vector<DWORD>(1000);
+					sendtime[s][0] = GetTickCount();  
 					if (setsockopt(s, SOL_SOCKET, SO_SNDBUF, (const char *)&udpBuffSize, sizeof(udpBuffSize)) == SOCKET_ERROR) {
 						cout << "set udp sendbuff failed!" << endl;
 					}
@@ -530,9 +525,8 @@ int main(int argc, char* argv[]) {
 				}
 			}
 			else {
-				getsockname(clientSocket[clientIP][clientPort], (SOCKADDR *)&(res.newAddr), &addrLen);
-				res.timestamp = duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
-				sendto(listenSocket, (char *)&res, sizeof(res), 0, (SOCKADDR *)&clientAddr, addrLen);
+				getsockname(clientSocket[clientIP][clientPort], (SOCKADDR *)&newAddr, &addrLen);
+				sendto(listenSocket, (char *)&newAddr, sizeof(newAddr), 0, (SOCKADDR *)&clientAddr, addrLen);
 			}
 		}
 	}
