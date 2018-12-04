@@ -203,7 +203,7 @@ int main(int argc, char* argv[]) {
 			timeKillEvent(timeOutId);
 		}
 		else {
-			cout << "get message from error address,  disconnect server!" << endl;
+			cout << "get error message, disconnect server" << endl;
 			return 0;
 		}
 

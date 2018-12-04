@@ -53,9 +53,6 @@ int udpBuffSize = 1000 * 1024;
 
 /***********************************************函数***************************************************/
 void closeSocket(SOCKET s) {
-	unsigned long clientIP = socketClientAddr[s].sin_addr.s_addr;
-	unsigned short clientPort = socketClientAddr[s].sin_port;
-	clientSocket[clientIP].erase(clientPort);
 	socketClientAddr.erase(s);
 	socketThread.erase(s);
 	socketTimeOut.erase(s);
@@ -133,22 +130,16 @@ DWORD WINAPI sendFileToClient(LPVOID lpParameter) {
 	//收到要发给客户端的文件的路径
 	if (recvfrom(s, filePath, 300, 0, (SOCKADDR *)&clientAddr, &clientAddrLen) != -1) {
 		timeKillEvent(socketTimeOut[s].second);
-		//防止错误的IP/端口发来的信息
-		if (clientAddr.sin_addr.s_addr != socketClientAddr[s].sin_addr.s_addr ||
-			clientAddr.sin_port != socketClientAddr[s].sin_port) {
-			cout << "get message from error address, ";
-			cout << "disconnect client: (";
-			cout << socketClientAddr[s].sin_addr.s_addr << ", " << socketClientAddr[s].sin_port << ")" << endl;
-			closeSocket(s);
-			return 0;
-		}
+		clientSocket[socketClientAddr[s].sin_addr.s_addr].erase(socketClientAddr[s].sin_port);
+		socketClientAddr[s] = clientAddr;
+
 		//初始化estimatedRTT和timeout
 		estimatedRTT[s] = GetTickCount() - socketPacket[s][0].sendtime;
 		socketTimeOut[s].first = 4 * estimatedRTT[s];
 	}
 	else {
 		timeKillEvent(socketTimeOut[s].second);
-		cout << "get message from error address, ";
+		cout << "get error message, ";
 		cout << "disconnect client: (";
 		cout << socketClientAddr[s].sin_addr.s_addr << ", " << socketClientAddr[s].sin_port << ")" << endl;
 		closeSocket(s);
@@ -310,21 +301,15 @@ DWORD WINAPI getFileFromClient(LPVOID lpParameter) {
 
 	if (recvfrom(s, filePath, 300, 0, (SOCKADDR *)&clientAddr, &clientAddrLen) != -1) {
 		timeKillEvent(socketTimeOut[s].second);
-		//防止错误的IP/端口发来的信息
-		if (clientAddr.sin_addr.s_addr != socketClientAddr[s].sin_addr.s_addr ||
-			clientAddr.sin_port != socketClientAddr[s].sin_port) {
-			cout << "get message from error address, ";
-			cout << "disconnect client: (";
-			cout << socketClientAddr[s].sin_addr.s_addr << ", " << socketClientAddr[s].sin_port << ")" << endl;
-			closeSocket(s);
-			return 0;
-		}
+		clientSocket[socketClientAddr[s].sin_addr.s_addr].erase(socketClientAddr[s].sin_port);
+		socketClientAddr[s] = clientAddr;
 		ackMessage.ack = 0;
 		sendto(s, (char *)&ackMessage, sizeof(ackMessage), 0, (SOCKADDR *)&(socketClientAddr[s]), sizeof(socketClientAddr[s]));
+		socketTimeOut[s].second = timeSetEvent(60000, 1, (LPTIMECALLBACK)closeThread, DWORD(1), TIME_ONESHOT);
 	}
 	else {
 		timeKillEvent(socketTimeOut[s].second);
-		cout << "get message from error address, ";
+		cout << "get error message, ";
 		cout << "disconnect client: (";
 		cout << socketClientAddr[s].sin_addr.s_addr << ", " << socketClientAddr[s].sin_port << ")" << endl;
 		closeSocket(s);
@@ -466,7 +451,10 @@ int main(int argc, char* argv[]) {
 			//创建与客户端的数据传输socket
 			if (clientSocket.count(clientIP) == 0 ||
 				clientSocket[clientIP].count(clientPort) == 0 ||
-				clientSocket[clientIP][clientPort] == 0) {
+				clientSocket[clientIP][clientPort] == 0 ||
+				socketClientAddr[clientSocket[clientIP][clientPort]].sin_addr.s_addr != clientIP ||
+				socketClientAddr[clientSocket[clientIP][clientPort]].sin_addr.s_addr != clientPort
+				) {
 				//创建socket
 				SOCKET s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
 				if (bind(s, (SOCKADDR *)&portzeroAddr, sizeof(portzeroAddr)) == SOCKET_ERROR) {
