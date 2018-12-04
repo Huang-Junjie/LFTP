@@ -49,6 +49,8 @@ struct {
 /****上传文件时的变量*****/
 unsigned int seq = 0;			//序号
 unsigned int rwnd = 100;		//接受窗口
+float cwnd = 1;					//拥塞窗口
+int ssthresh = 64;				//阈值
 unsigned int sendbase;			//第一个未确认的数据包在缓冲区的下标
 unsigned int nextseqnum = 0;	//下一个将文件读入缓冲区的下标
 unsigned int redundancy = 0;	//冗余ack计数
@@ -112,12 +114,15 @@ void WINAPI disconnect(UINT wTimerID, UINT msg, DWORD dwUser, DWORD dwl, DWORD d
 void WINAPI resendFileData(UINT wTimerID, UINT msg, DWORD dwUser, DWORD dwl, DWORD dw2) {
 	SOCKET s = dwUser;
 	if (timeOut > 30000) {
-		cout << "disconnect from server: (";
+		cout << "disconnect from server";
 		exit(0);
 	}
 	cout << "timeout resend seq: " << packetBuff[sendbase].seq << endl;
 	packetBuff[sendbase].timestamp = duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
 	sendto(s, (char *)(&packetBuff[sendbase]), sizeof(packet), 0, (SOCKADDR *)&(serverDataAddr), sizeof(serverDataAddr));
+	ssthresh = cwnd / 2;
+	cwnd = 1;
+	redundancy = 0;
 	timeOut *= 2;
 	timeOutId = timeSetEvent(timeOut, 1, (LPTIMECALLBACK)resendFileData, DWORD(s), TIME_ONESHOT);
 }
@@ -219,7 +224,7 @@ int main(int argc, char* argv[]) {
 
 		/*******************开始上传文件************************/
 		while (!file.eof()) {
-			while (!file.eof() && ((nextseqnum + 1001 - sendbase) % 1001) < rwnd) {
+			while (!file.eof() && ((nextseqnum + 1001 - sendbase) % 1001) < min(rwnd, cwnd)) {
 				if (sendbase == nextseqnum) {
 					timeOutId = timeSetEvent(2000, 1, (LPTIMECALLBACK)resendFileData, DWORD(s), TIME_ONESHOT);
 				}
@@ -250,8 +255,12 @@ int main(int argc, char* argv[]) {
 					timeOut = calculateTimeOut(estimatedRTT, DevRTT,
 												duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count()
 												- ackMessage.timestamp + ackMessage.resDelay);
-					sendbase = (sendbase + ackMessage.ack - packetBuff[sendbase].seq) % 1001;
+					cout << "timeout = " << timeOut << "ms" << endl;
+					if (cwnd >= ssthresh) cwnd = cwnd + 1.0 / cwnd;
+					else cwnd++;
+					if (redundancy >= 3) cwnd = ssthresh;
 					redundancy = 0;
+					sendbase = (sendbase + ackMessage.ack - packetBuff[sendbase].seq) % 1001;
 					timeKillEvent(timeOutId);
 					if (sendbase != nextseqnum) {
 						timeOutId = timeSetEvent(timeOut, 1, (LPTIMECALLBACK)resendFileData, DWORD(s), TIME_ONESHOT);
@@ -267,6 +276,11 @@ int main(int argc, char* argv[]) {
 						packetBuff[sendbase].timestamp = duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
 						sendto(s, (char *)(&packetBuff[sendbase]), sizeof(packet), 0, (SOCKADDR *)&(serverDataAddr), sizeof(serverDataAddr));
 						cout << "quik resend seq: " << packetBuff[sendbase].seq << endl;
+						ssthresh = cwnd / 2;
+						cwnd += 3;
+					}
+					else if (redundancy > 3) {
+						cwnd++;
 					}
 				}
 				//ack < base：base之前的包都已经被确认，因此不用响应小于base的ack
@@ -274,10 +288,10 @@ int main(int argc, char* argv[]) {
 		}
 		file.close();
 		while (sendbase != nextseqnum) {
-			if (recvfrom(s, (char *)&ackMessage, sizeof(ackMessage), 0, (SOCKADDR *)&clientAddr, &serveraddrLen) != -1) {
+			if (recvfrom(s, (char *)&ackMessage, sizeof(ackMessage), 0, (SOCKADDR *)&rcvDataAddr, &serveraddrLen) != -1) {
 				//防止错误的IP/端口发来的信息
-				if (clientAddr.sin_addr.s_addr != serverDataAddr.sin_addr.s_addr ||
-					clientAddr.sin_port != serverDataAddr.sin_port) {
+				if (rcvDataAddr.sin_addr.s_addr != serverDataAddr.sin_addr.s_addr ||
+					rcvDataAddr.sin_port != serverDataAddr.sin_port) {
 					continue;
 				}
 
@@ -289,10 +303,14 @@ int main(int argc, char* argv[]) {
 				//ack > base: ack之前的都被确认，因此base = ack
 				if (ackMessage.ack > packetBuff[sendbase].seq) {
 					timeOut = calculateTimeOut(estimatedRTT, DevRTT,
-												duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count()
-												- ackMessage.timestamp + ackMessage.resDelay);
-					sendbase = (sendbase + ackMessage.ack - packetBuff[sendbase].seq) % 1001;
+						duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count()
+						- ackMessage.timestamp + ackMessage.resDelay);
+					cout << "timeout = " << timeOut << "ms" << endl;
+					if (cwnd >= ssthresh) cwnd = cwnd + 1.0 / cwnd;
+					else cwnd++;
+					if (redundancy >= 3) cwnd = ssthresh;
 					redundancy = 0;
+					sendbase = (sendbase + ackMessage.ack - packetBuff[sendbase].seq) % 1001;
 					timeKillEvent(timeOutId);
 					if (sendbase != nextseqnum) {
 						timeOutId = timeSetEvent(timeOut, 1, (LPTIMECALLBACK)resendFileData, DWORD(s), TIME_ONESHOT);
@@ -301,13 +319,18 @@ int main(int argc, char* argv[]) {
 				//ack = base: 3次冗余ack，快速重传base
 				else if (ackMessage.ack == packetBuff[sendbase].seq) {
 					timeOut = calculateTimeOut(estimatedRTT, DevRTT,
-												duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count()
-												- ackMessage.timestamp + ackMessage.resDelay);
+						duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count()
+						- ackMessage.timestamp + ackMessage.resDelay);
 					redundancy++;
 					if (redundancy == 3) {
 						packetBuff[sendbase].timestamp = duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
 						sendto(s, (char *)(&packetBuff[sendbase]), sizeof(packet), 0, (SOCKADDR *)&(serverDataAddr), sizeof(serverDataAddr));
 						cout << "quik resend seq: " << packetBuff[sendbase].seq << endl;
+						ssthresh = cwnd / 2;
+						cwnd += 3;
+					}
+					else if (redundancy > 3) {
+						cwnd++;
 					}
 				}
 				//ack < base：base之前的包都已经被确认，因此不用响应小于base的ack
